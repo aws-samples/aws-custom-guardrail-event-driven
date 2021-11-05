@@ -1,0 +1,177 @@
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Guardrail for AWS Glue Encryption Compliance"
+
+Resources:
+  KMSKeyGlue:
+    Type: "AWS::KMS::Key"
+    Properties:
+      Description: AWS KMS Key for AWS Glue
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Allow access through AWS Glue for all principals in the account that are authorized to use Glue
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref 'AWS::AccountId'
+                kms:ViaService: !Sub 'glue.${AWS::Region}.amazonaws.com'
+          - Sid: Root Access to Manage the Key
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:*
+            Resource: '*'
+
+  KMSAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: "alias/KMSKeyGlue"
+      TargetKeyId: !Ref KMSKeyGlue
+
+  SSMKMSKey:
+    Type: AWS::SSM::Parameter
+    Properties: 
+      Description: SSM Parameter Store to keep KMS Glue ARN
+      Name: /KMSKeyGlue
+      Type: String
+      Value: !GetAtt KMSKeyGlue.Arn
+
+  EventsBridgeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: Rule for event PutDataCatalogEncryptionSettings from CloudTrail
+      Name: GuardrailGlueEncryption
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - glue.amazonaws.com  
+          eventName:
+            - PutDataCatalogEncryptionSettings
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaGuardrailGlueEncryption.Arn
+          Id: Guardrail001
+
+  LambdaGuardrailGlueEncryption:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.8
+      Role: !GetAtt LambdaGuardrailGlueEncryptionRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          import boto3, json
+          glue = boto3.client('glue')
+          ssm = boto3.client('ssm')
+    
+          def handler(event, context):
+
+            # Setting of security configuration encryption for AWS Glue (Default Data Catalog) and Connection Password Encryption 
+            kms_get_parameter = ssm.get_parameter(Name='KMSKeyGlue', WithDecryption=False)
+            kms_arn = kms_get_parameter['Parameter']['Value']
+            
+            # Print the event PutDataCatalogEncryptionSettings collected from CloudTrail by EventBridge (logging purpose)
+            print('Event collected from CloudTrail by EventBridge:')
+            print(json.dumps(event))
+            
+            # Get key/value from event and Create parameters of encryption settings to be evaluated 
+            event_datacatalog = event['detail']['requestParameters']['dataCatalogEncryptionSettings']['encryptionAtRest']['catalogEncryptionMode']
+            event_connection_password = event['detail']['requestParameters']['dataCatalogEncryptionSettings']['connectionPasswordEncryption']['returnConnectionPasswordEncrypted']
+
+            # Evaluation and Remediation of encryption settings for AWS Glue
+            if event_datacatalog == 'DISABLED' or event_connection_password == False:
+
+                print('Non-compliant - Encryption Settings for AWS Glue. The remediation will be started.')
+                putsettings = glue.put_data_catalog_encryption_settings(
+                DataCatalogEncryptionSettings={
+                    'EncryptionAtRest': {
+                        'CatalogEncryptionMode': 'SSE-KMS',
+                        'SseAwsKmsKeyId': f'{kms_arn}'
+                    },
+                    'ConnectionPasswordEncryption': {
+                        'ReturnConnectionPasswordEncrypted': True,
+                        'AwsKmsKeyId': f'{kms_arn}'
+                    }
+                }
+            )
+      
+            else:
+                print('Compliant - Encryption Settings for AWS Glue.')
+      TracingConfig:
+        Mode: Active
+
+  LambdaGuardrailGlueEncryptionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: LambdaGuardrailGlueEncryptionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - 'sts:AssumeRole'
+      Path: '/'
+
+  LambdaGuardrailGlueEncryptionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      Description: Policy with permissions for AWS Lambda execution and remediation action
+      ManagedPolicyName: LambdaGuardrailGlueEncryptionPolicy
+      Path: "/"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+            - "glue:PutDataCatalogEncryptionSettings"
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - "ssm:GetParameter"
+          Resource: !Sub "arn:aws:ssm:*:${AWS::AccountId}:parameter/KMSKeyGlue"
+      Roles: 
+        - !Ref LambdaGuardrailGlueEncryptionRole
+
+  PermissionEvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaGuardrailGlueEncryption.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventsBridgeRule.Arn
+
+  InitialConfigEncryption:
+    Type: AWS::Glue::DataCatalogEncryptionSettings
+    DependsOn: KMSAlias
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DataCatalogEncryptionSettings:
+        EncryptionAtRest: 
+            CatalogEncryptionMode: 'SSE-KMS'
+            SseAwsKmsKeyId: !GetAtt KMSKeyGlue.Arn
+        ConnectionPasswordEncryption: 
+            KmsKeyId: !GetAtt KMSKeyGlue.Arn
+            ReturnConnectionPasswordEncrypted: True
